@@ -21,16 +21,8 @@
 
 #define MSM_VDEC_DVC_NAME "msm_vdec_8974"
 #define MIN_NUM_OUTPUT_BUFFERS 4
-#ifdef CONFIG_MACH_LGE
-#define MAX_NUM_OUTPUT_BUFFERS VIDEO_MAX_FRAME
-#else
 #define MAX_NUM_OUTPUT_BUFFERS 6
-#endif
-
-// LGE_CHANGE_S, [G2_Player][kyungmin.jun@lge.com], 20131202  DEFAULT_CONCEAL_COLOR value change from green to black {
-//#define DEFAULT_CONCEAL_COLOR 0x0
-#define DEFAULT_CONCEAL_COLOR 0x108080
-// LGE_CHANGE_S, [G2_Player][kyungmin.jun@lge.com], 20131202 DEFAULT_CONCEAL_COLOR value change from green to black }
+#define DEFAULT_VIDEO_CONCEAL_COLOR_BLACK 0x8080
 
 #define TZ_INFO_GET_FEATURE_VERSION_ID 0x3
 #define TZ_DYNAMIC_BUFFER_FEATURE_ID 12
@@ -333,6 +325,16 @@ static struct msm_vidc_ctrl msm_vdec_ctrls[] = {
 		.qmenu = NULL,
 		.cluster = 0,
 	},
+	{
+		.id = V4L2_CID_MPEG_VIDC_VIDEO_CONCEAL_COLOR,
+		.name = "Picture concealed color",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.minimum = 0x0,
+		.maximum = 0xffffff,
+		.default_value = DEFAULT_VIDEO_CONCEAL_COLOR_BLACK,
+		.step = 1,
+		.cluster = 0,
+	},
 };
 
 #define NUM_CTRLS ARRAY_SIZE(msm_vdec_ctrls)
@@ -619,12 +621,24 @@ int msm_vdec_release_buf(struct msm_vidc_inst *inst,
 					b->m.planes[extra_idx].m.userptr;
 			else
 				buffer_info.extradata_addr = 0;
-			buffer_info.response_required = false;
+			buffer_info.response_required = true;
+			init_completion(
+				&inst->completions[SESSION_MSG_INDEX
+				(SESSION_RELEASE_BUFFER_DONE)]);
 			rc = call_hfi_op(hdev, session_release_buffers,
 				(void *)inst->session, &buffer_info);
 			if (rc)
 				dprintk(VIDC_ERR,
 				"vidc_hal_session_release_buffers failed");
+			rc = wait_for_completion_timeout(
+				&inst->completions[SESSION_MSG_INDEX(SESSION_RELEASE_BUFFER_DONE)],
+				msecs_to_jiffies(msm_vidc_hw_rsp_timeout));
+			if (!rc) {
+				dprintk(VIDC_ERR, "Wait interrupted or timeout: %d\n", rc);
+				msm_comm_recover_from_session_error(inst);
+				rc = -EIO;
+			}
+
 		break;
 	default:
 		dprintk(VIDC_ERR, "Buffer type not recognized: %d\n", b->type);
@@ -981,11 +995,17 @@ int msm_vdec_s_fmt(struct msm_vidc_inst *inst, struct v4l2_format *f)
 			rc = -EINVAL;
 			goto err_invalid_fmt;
 		}
+		rc = msm_comm_try_state(inst, MSM_VIDC_CORE_INIT_DONE);
+		if (rc) {
+			dprintk(VIDC_ERR, "Failed to initialize instance\n");
+			goto err_invalid_fmt;
+		}
 		if (!(get_hal_codec_type(fmt->fourcc) &
 			inst->core->dec_codec_supported)) {
 			dprintk(VIDC_ERR,
-				"Codec(0x%x) not supported\n",
-				get_hal_codec_type(fmt->fourcc));
+				"Codec(0x%x) is not present in the supported codecs list(0x%x)\n",
+				get_hal_codec_type(fmt->fourcc),
+				inst->core->dec_codec_supported);
 			rc = -EINVAL;
 			goto err_invalid_fmt;
 		}
@@ -1120,18 +1140,6 @@ static int msm_vdec_queue_setup(struct vb2_queue *q,
 				"Failed to set new buffer count(%d) on FW, err: %d\n",
 				new_buf_count.buffer_count_actual, rc);
 		}
-		// LGE_CHANGE_S, [G2_Player][haewook.kim@lge.com], 20130626, msm vdec Update firmware with input buffer count
-		property_id = HAL_PARAM_BUFFER_COUNT_ACTUAL;
-		new_buf_count.buffer_type = HAL_BUFFER_INPUT;
-		new_buf_count.buffer_count_actual = *num_buffers;
-		rc = call_hfi_op(hdev, session_set_property,
-		inst->session, property_id, &new_buf_count);
-		if (rc) {
-			dprintk(VIDC_WARN,
-					"Failed to set new buffer count(%d) on FW, err: %d\n",
-			new_buf_count.buffer_count_actual, rc);
-		}
-		// LGE_CHANGE_E, [G2_Player][haewook.kim@lge.com], 20130626, msm vdec Update firmware with input buffer count
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		dprintk(VIDC_DBG, "Getting bufreqs on capture plane\n");
@@ -1341,7 +1349,6 @@ static int msm_vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct msm_vidc_inst *inst;
 	int rc = 0;
-	int pdata = DEFAULT_CONCEAL_COLOR;
 	struct hfi_device *hdev;
 	if (!q || !q->drv_priv) {
 		dprintk(VIDC_ERR, "Invalid input, q = %p\n", q);
@@ -1359,10 +1366,6 @@ static int msm_vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		if (inst->bufq[CAPTURE_PORT].vb2_bufq.streaming)
 			rc = start_streaming(inst);
-		rc = call_hfi_op(hdev, session_set_property,
-			(void *) inst->session,
-			HAL_PARAM_VDEC_CONCEAL_COLOR,
-			(void *) &pdata);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		if (inst->bufq[OUTPUT_PORT].vb2_bufq.streaming)
@@ -1432,7 +1435,19 @@ int msm_vdec_cmd(struct msm_vidc_inst *inst, struct v4l2_decoder_cmd *dec)
 	}
 	switch (dec->cmd) {
 	case V4L2_DEC_QCOM_CMD_FLUSH:
+		if (core->state != VIDC_CORE_INVALID &&
+			inst->state ==  MSM_VIDC_CORE_INVALID) {
+			rc = msm_comm_recover_from_session_error(inst);
+			if (rc)
+				dprintk(VIDC_ERR,
+					"Failed to recover from session_error: %d\n",
+					rc);
+		}
 		rc = msm_comm_flush(inst, dec->flags);
+		if (rc) {
+			dprintk(VIDC_ERR,
+					"Failed to flush buffers: %d\n", rc);
+		}
 		break;
 	case V4L2_DEC_CMD_STOP:
 		if (core->state != VIDC_CORE_INVALID &&
@@ -1460,9 +1475,6 @@ int msm_vdec_cmd(struct msm_vidc_inst *inst, struct v4l2_decoder_cmd *dec)
 			goto exit;
 		}
 		rc = msm_comm_try_state(inst, MSM_VIDC_CLOSE_DONE);
-		/* Clients rely on this event for joining poll thread.
-		 * This event should be returned even if firmware has
-		 * failed to respond */
 		msm_vidc_queue_v4l2_event(inst, V4L2_EVENT_MSM_VIDC_CLOSE_DONE);
 		break;
 	default:
@@ -1754,6 +1766,11 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 			break;
 		}
 		break;
+	case V4L2_CID_MPEG_VIDC_VIDEO_CONCEAL_COLOR:
+		property_id = HAL_PARAM_VDEC_CONCEAL_COLOR;
+		property_val = ctrl->val;
+		pdata = &property_val;
+		break;
 	default:
 		break;
 	}
@@ -1864,14 +1881,10 @@ int msm_vdec_ctrl_init(struct msm_vidc_inst *inst)
 	for (; idx < NUM_CTRLS; idx++) {
 		struct v4l2_ctrl *ctrl = NULL;
 		if (IS_PRIV_CTRL(msm_vdec_ctrls[idx].id)) {
-			/*add private control*/
+			
 			ctrl_cfg.def = msm_vdec_ctrls[idx].default_value;
 			ctrl_cfg.flags = 0;
 			ctrl_cfg.id = msm_vdec_ctrls[idx].id;
-			/* ctrl_cfg.is_private =
-			 * msm_vdec_ctrls[idx].is_private;
-			 * ctrl_cfg.is_volatile =
-			 * msm_vdec_ctrls[idx].is_volatile;*/
 			ctrl_cfg.max = msm_vdec_ctrls[idx].maximum;
 			ctrl_cfg.min = msm_vdec_ctrls[idx].minimum;
 			ctrl_cfg.menu_skip_mask =
@@ -1913,7 +1926,7 @@ int msm_vdec_ctrl_init(struct msm_vidc_inst *inst)
 			"Error adding ctrls to ctrl handle, %d\n",
 			inst->ctrl_handler.error);
 
-	/* Construct clusters */
+	
 	for (idx = 1; idx < MSM_VDEC_CTRL_CLUSTER_MAX; ++idx) {
 		struct msm_vidc_ctrl_cluster *temp = NULL;
 		struct v4l2_ctrl **cluster = NULL;
