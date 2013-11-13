@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -97,7 +97,8 @@ enum hal_extradata_id {
 	HAL_EXTRADATA_NUM_CONCEALED_MB,
 	HAL_EXTRADATA_METADATA_FILLER,
 	HAL_EXTRADATA_ASPECT_RATIO,
-	HAL_EXTRADATA_MPEG2_SEQDISP
+	HAL_EXTRADATA_MPEG2_SEQDISP,
+	HAL_EXTRADATA_LTR_INFO
 };
 
 enum hal_property {
@@ -177,6 +178,10 @@ enum hal_property {
 	HAL_PARAM_BUFFER_ALLOC_MODE,
 	HAL_PARAM_VDEC_FRAME_ASSEMBLY,
 	HAL_PARAM_VDEC_CONCEAL_COLOR,
+	HAL_PARAM_VENC_LTRMODE,
+	HAL_CONFIG_VENC_MARKLTRFRAME,
+	HAL_CONFIG_VENC_USELTRFRAME,
+	HAL_CONFIG_VENC_LTRPERIOD,
 };
 
 enum hal_domain {
@@ -551,18 +556,6 @@ struct hal_profile_level {
 	u32 profile;
 	u32 level;
 };
-/*
-struct hal_profile_level_range {
-	u32 profile;
-	u32 min_level;
-	u32 max_level;
-}
-
-struct hal_profile_level_supported {
-	u32 profile_count;
-	struct hal_profile_level_range profile_level[1];
-};
-*/
 enum hal_h264_entropy {
 	HAL_H264_ENTROPY_CAVLC = 1,
 	HAL_H264_ENTROPY_CABAC = 2,
@@ -701,7 +694,7 @@ struct hal_buffer_requirements {
 	u32 buffer_alignment;
 };
 
-enum hal_priority {/* Priority increases with number */
+enum hal_priority {
 	HAL_PRIORITY_LOW = 10,
 	HAL_PRIOIRTY_MEDIUM = 20,
 	HAL_PRIORITY_HIGH = 30,
@@ -896,10 +889,29 @@ struct hal_buffer_alloc_mode {
 	enum buffer_mode_type buffer_mode;
 };
 
-/* HAL Response */
+enum ltr_mode {
+	HAL_LTR_MODE_DISABLE,
+	HAL_LTR_MODE_MANUAL,
+	HAL_LTR_MODE_PERIODIC,
+};
 
+struct hal_ltrmode {
+	enum ltr_mode ltrmode;
+	u32 ltrcount;
+	u32 trustmode;
+};
+
+struct hal_ltruse {
+	u32 refltr;
+	u32 useconstrnt;
+	u32 frames;
+};
+
+struct hal_ltrmark {
+	u32 markframe;
+};
+/* HAL Response */
 enum command_response {
-/* SYSTEM COMMANDS_DONE*/
 	VIDC_EVENT_CHANGE,
 	SYS_INIT_DONE,
 	SET_RESOURCE_DONE,
@@ -910,7 +922,6 @@ enum command_response {
 	SYS_DEBUG,
 	SYS_WATCHDOG_TIMEOUT,
 	SYS_ERROR,
-/* SESSION COMMANDS_DONE */
 	SESSION_LOAD_RESOURCE_DONE,
 	SESSION_INIT_DONE,
 	SESSION_END_DONE,
@@ -933,7 +944,6 @@ enum command_response {
 	RESPONSE_UNUSED = 0x10000000,
 };
 
-/* Command Callback structure */
 
 struct msm_vidc_cb_cmd_done {
 	u32 device_id;
@@ -954,7 +964,6 @@ struct msm_vidc_cb_event {
 	u8 *exra_data_buffer;
 };
 
-/* Data callback structure */
 
 struct vidc_hal_ebd {
 	u32 timestamp_hi;
@@ -1076,7 +1085,7 @@ enum dev_info {
 struct hfi_device {
 	void *hfi_device_data;
 
-	/*Add function pointers for all the hfi functions below*/
+	
 	int (*core_init)(void *device);
 	int (*core_release)(void *device);
 	int (*core_pc_prep)(void *device);
@@ -1144,4 +1153,4 @@ void vidc_hfi_deinitialize(enum msm_vidc_hfi_type hfi_type,
 			struct hfi_device *hdev);
 
 
-#endif /*__VIDC_HFI_API_H__ */
+#endif 
