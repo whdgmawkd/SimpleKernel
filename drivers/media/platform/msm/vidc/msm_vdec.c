@@ -21,16 +21,8 @@
 
 #define MSM_VDEC_DVC_NAME "msm_vdec_8974"
 #define MIN_NUM_OUTPUT_BUFFERS 4
-#ifdef CONFIG_MACH_LGE
 #define MAX_NUM_OUTPUT_BUFFERS VIDEO_MAX_FRAME
-#else
-#define MAX_NUM_OUTPUT_BUFFERS 6
-#endif
-
-// LGE_CHANGE_S, [G2_Player][kyungmin.jun@lge.com], 20131202  DEFAULT_CONCEAL_COLOR value change from green to black {
-//#define DEFAULT_CONCEAL_COLOR 0x0
-#define DEFAULT_CONCEAL_COLOR 0x108080
-// LGE_CHANGE_S, [G2_Player][kyungmin.jun@lge.com], 20131202 DEFAULT_CONCEAL_COLOR value change from green to black }
+#define DEFAULT_VIDEO_CONCEAL_COLOR_BLACK 0x8080
 
 #define TZ_DYNAMIC_BUFFER_FEATURE_ID 12
 #define TZ_FEATURE_VERSION(major, minor, patch) \
@@ -327,6 +319,16 @@ static struct msm_vidc_ctrl msm_vdec_ctrls[] = {
 		.qmenu = NULL,
 		.cluster = 0,
 	},
+	{
+		.id = V4L2_CID_MPEG_VIDC_VIDEO_CONCEAL_COLOR,
+		.name = "Picture concealed color",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.minimum = 0x0,
+		.maximum = 0xffffff,
+		.default_value = DEFAULT_VIDEO_CONCEAL_COLOR_BLACK,
+		.step = 1,
+		.cluster = 0,
+	},
 };
 
 #define NUM_CTRLS ARRAY_SIZE(msm_vdec_ctrls)
@@ -572,7 +574,15 @@ int msm_vdec_release_buf(struct msm_vidc_inst *inst,
 				core);
 		goto exit;
 	}
-
+	if (!inst->in_reconfig) {
+		rc = msm_comm_try_state(inst, MSM_VIDC_RELEASE_RESOURCES_DONE);
+		if (rc) {
+			dprintk(VIDC_ERR,
+				"Failed to move inst: %p to relase res done\n",
+				inst);
+			goto exit;
+		}
+	}
 	switch (b->type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		break;
@@ -1112,18 +1122,6 @@ static int msm_vdec_queue_setup(struct vb2_queue *q,
 				"Failed to set new buffer count(%d) on FW, err: %d\n",
 				new_buf_count.buffer_count_actual, rc);
 		}
-		// LGE_CHANGE_S, [G2_Player][haewook.kim@lge.com], 20130626, msm vdec Update firmware with input buffer count
-		property_id = HAL_PARAM_BUFFER_COUNT_ACTUAL;
-		new_buf_count.buffer_type = HAL_BUFFER_INPUT;
-		new_buf_count.buffer_count_actual = *num_buffers;
-		rc = call_hfi_op(hdev, session_set_property,
-		inst->session, property_id, &new_buf_count);
-		if (rc) {
-			dprintk(VIDC_WARN,
-					"Failed to set new buffer count(%d) on FW, err: %d\n",
-			new_buf_count.buffer_count_actual, rc);
-		}
-		// LGE_CHANGE_E, [G2_Player][haewook.kim@lge.com], 20130626, msm vdec Update firmware with input buffer count
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		dprintk(VIDC_DBG, "Getting bufreqs on capture plane\n");
@@ -1333,7 +1331,6 @@ static int msm_vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct msm_vidc_inst *inst;
 	int rc = 0;
-	int pdata = DEFAULT_CONCEAL_COLOR;
 	struct hfi_device *hdev;
 	if (!q || !q->drv_priv) {
 		dprintk(VIDC_ERR, "Invalid input, q = %p\n", q);
@@ -1351,10 +1348,6 @@ static int msm_vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		if (inst->bufq[CAPTURE_PORT].vb2_bufq.streaming)
 			rc = start_streaming(inst);
-		rc = call_hfi_op(hdev, session_set_property,
-			(void *) inst->session,
-			HAL_PARAM_VDEC_CONCEAL_COLOR,
-			(void *) &pdata);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		if (inst->bufq[OUTPUT_PORT].vb2_bufq.streaming)
@@ -1424,7 +1417,19 @@ int msm_vdec_cmd(struct msm_vidc_inst *inst, struct v4l2_decoder_cmd *dec)
 	}
 	switch (dec->cmd) {
 	case V4L2_DEC_QCOM_CMD_FLUSH:
+		if (core->state != VIDC_CORE_INVALID &&
+			inst->state ==  MSM_VIDC_CORE_INVALID) {
+			rc = msm_comm_recover_from_session_error(inst);
+			if (rc)
+				dprintk(VIDC_ERR,
+					"Failed to recover from session_error: %d\n",
+					rc);
+		}
 		rc = msm_comm_flush(inst, dec->flags);
+		if (rc) {
+			dprintk(VIDC_ERR,
+					"Failed to flush buffers: %d\n", rc);
+		}
 		break;
 	case V4L2_DEC_CMD_STOP:
 		if (core->state != VIDC_CORE_INVALID &&
@@ -1744,6 +1749,11 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 			rc = -ENOTSUPP;
 			break;
 		}
+		break;
+	case V4L2_CID_MPEG_VIDC_VIDEO_CONCEAL_COLOR:
+		property_id = HAL_PARAM_VDEC_CONCEAL_COLOR;
+		property_val = ctrl->val;
+		pdata = &property_val;
 		break;
 	default:
 		break;
