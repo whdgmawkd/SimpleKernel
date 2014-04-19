@@ -33,7 +33,7 @@ static struct cpus {
 	struct cpufreq_policy policy;
 } cpu_stats = {
 	.throttling = false,
-	.thermal_steps = {729600, 1036800, 1267200, 1497600},
+	.thermal_steps = {960000, 1267200, 1574400, 1728000},
 	.limited_max_freq = UINT_MAX,
 };
 
