@@ -83,7 +83,7 @@ struct msm_iommu_remote_lock {
 
 static struct msm_iommu_remote_lock msm_iommu_remote_lock;
 
-#ifdef CONFIG_MSM_IOMMU_GPU_SYNC
+#ifdef CONFIG_MSM_IOMMU_SYNC
 static void _msm_iommu_remote_spin_lock_init(void)
 {
 	msm_iommu_remote_lock.lock = smem_alloc(SMEM_SPINLOCK_ARRAY, 32);
@@ -91,8 +91,11 @@ static void _msm_iommu_remote_spin_lock_init(void)
 			sizeof(*msm_iommu_remote_lock.lock));
 }
 
-void msm_iommu_remote_p0_spin_lock(void)
+void msm_iommu_remote_p0_spin_lock(unsigned int need_lock)
 {
+	if (!need_lock)
+		return;
+
 	msm_iommu_remote_lock.lock->flag[PROC_APPS] = 1;
 	msm_iommu_remote_lock.lock->turn = 1;
 
@@ -103,8 +106,11 @@ void msm_iommu_remote_p0_spin_lock(void)
 		cpu_relax();
 }
 
-void msm_iommu_remote_p0_spin_unlock(void)
+void msm_iommu_remote_p0_spin_unlock(unsigned int need_lock)
 {
+	if (!need_lock)
+		return;
+
 	smp_mb();
 
 	msm_iommu_remote_lock.lock->flag[PROC_APPS] = 0;
@@ -200,14 +206,16 @@ static void *_iommu_lock_initialize(void)
 	return msm_iommu_lock_initialize();
 }
 
-static void _iommu_lock_acquire(void)
+static void _iommu_lock_acquire(unsigned int need_extra_lock)
 {
-	msm_iommu_lock();
+	msm_iommu_mutex_lock();
+	msm_iommu_remote_spin_lock(need_extra_lock);
 }
 
-static void _iommu_lock_release(void)
+static void _iommu_lock_release(unsigned int need_extra_lock)
 {
-	msm_iommu_unlock();
+	msm_iommu_remote_spin_unlock(need_extra_lock);
+	msm_iommu_mutex_unlock();
 }
 
 struct iommu_access_ops iommu_access_ops_v0 = {
@@ -241,7 +249,7 @@ static int __flush_iotlb_va(struct iommu_domain *domain, unsigned int va)
 		if (ret)
 			goto fail;
 
-		msm_iommu_remote_spin_lock();
+		msm_iommu_remote_spin_lock(iommu_drvdata->needs_rem_spinlock);
 
 		asid = GET_CONTEXTIDR_ASID(iommu_drvdata->base,
 					   ctx_drvdata->num);
@@ -250,7 +258,7 @@ static int __flush_iotlb_va(struct iommu_domain *domain, unsigned int va)
 			   asid | (va & TLBIVA_VA));
 		mb();
 
-		msm_iommu_remote_spin_unlock();
+		msm_iommu_remote_spin_unlock(iommu_drvdata->needs_rem_spinlock);
 
 		__disable_clocks(iommu_drvdata);
 	}
@@ -278,7 +286,7 @@ static int __flush_iotlb(struct iommu_domain *domain)
 		if (ret)
 			goto fail;
 
-		msm_iommu_remote_spin_lock();
+		msm_iommu_remote_spin_lock(iommu_drvdata->needs_rem_spinlock);
 
 		asid = GET_CONTEXTIDR_ASID(iommu_drvdata->base,
 					   ctx_drvdata->num);
@@ -286,7 +294,7 @@ static int __flush_iotlb(struct iommu_domain *domain)
 		SET_TLBIASID(iommu_drvdata->base, ctx_drvdata->num, asid);
 		mb();
 
-		msm_iommu_remote_spin_unlock();
+		msm_iommu_remote_spin_unlock(iommu_drvdata->needs_rem_spinlock);
 
 		__disable_clocks(iommu_drvdata);
 	}
@@ -318,13 +326,16 @@ static void __reset_context(void __iomem *base, void __iomem *glb_base, int ctx)
 	mb();
 }
 
-static void __program_context(void __iomem *base, void __iomem *glb_base,
+static void __program_context(struct msm_iommu_drvdata *iommu_drvdata,
 			      int ctx, int ncb, phys_addr_t pgtable,
 			      int redirect, int ttbr_split)
 {
+	void __iomem *base = iommu_drvdata->base;
+	void __iomem *glb_base = iommu_drvdata->glb_base;
 	unsigned int prrr, nmrr;
 	int i, j, found;
-	msm_iommu_remote_spin_lock();
+
+	msm_iommu_remote_spin_lock(iommu_drvdata->needs_rem_spinlock);
 
 	__reset_context(base, glb_base, ctx);
 
@@ -416,7 +427,7 @@ static void __program_context(void __iomem *base, void __iomem *glb_base,
 	SET_M(base, ctx, 1);
 	mb();
 
-	msm_iommu_remote_spin_unlock();
+	msm_iommu_remote_spin_unlock(iommu_drvdata->needs_rem_spinlock);
 }
 
 static int msm_iommu_domain_init(struct iommu_domain *domain, int flags)
@@ -432,6 +443,11 @@ static int msm_iommu_domain_init(struct iommu_domain *domain, int flags)
 
 	if (!priv->pt.fl_table)
 		goto fail_nomem;
+
+#ifdef CONFIG_LGE_MEMORY_INFO
+	__mod_zone_page_state(page_zone(virt_to_page((void *)priv->pgtable)),
+							NR_IOMMU_PAGES, (1UL << get_order(SZ_16K)));
+#endif
 
 #ifdef CONFIG_IOMMU_PGTABLES_L2
 	priv->pt.redirect = flags & MSM_IOMMU_DOMAIN_PT_CACHEABLE;
@@ -462,13 +478,27 @@ static void msm_iommu_domain_destroy(struct iommu_domain *domain)
 
 	if (priv) {
 		fl_table = priv->pt.fl_table;
+#ifdef CONFIG_LGE_MEMORY_INFO
+		for (i = 0; i < NUM_FL_PTE; i++)
+			if ((fl_table[i] & 0x03) == FL_TYPE_TABLE) {
+				__dec_zone_page_state(virt_to_page((void *)(unsigned long) __va(((fl_table[i]) &
+								FL_BASE_MASK))), NR_IOMMU_PAGES);
+				free_page((unsigned long) __va(((fl_table[i]) &
+								FL_BASE_MASK)));
+			}
 
+		__mod_zone_page_state(page_zone(virt_to_page((void *)(unsigned long)priv->pt.fl_table)),
+							NR_IOMMU_PAGES, - (1UL << get_order(SZ_16K)));
+
+		free_pages((unsigned long)priv->pt.fl_table, get_order(SZ_16K));
+#else
 		for (i = 0; i < NUM_FL_PTE; i++)
 			if ((fl_table[i] & 0x03) == FL_TYPE_TABLE)
 				free_page((unsigned long) __va(((fl_table[i]) &
 								FL_BASE_MASK)));
 
 		free_pages((unsigned long)priv->pt.fl_table, get_order(SZ_16K));
+#endif
 		priv->pt.fl_table = NULL;
 	}
 
@@ -526,7 +556,7 @@ static int msm_iommu_attach_dev(struct iommu_domain *domain, struct device *dev)
 	if (ret)
 		goto unlock;
 
-	__program_context(iommu_drvdata->base, iommu_drvdata->glb_base,
+	__program_context(iommu_drvdata,
 			  ctx_drvdata->num, iommu_drvdata->ncb,
 			  __pa(priv->pt.fl_table), priv->pt.redirect,
 			  iommu_drvdata->ttbr_split);
@@ -577,7 +607,7 @@ static void msm_iommu_detach_dev(struct iommu_domain *domain,
 	if (ret)
 		goto unlock;
 
-	msm_iommu_remote_spin_lock();
+	msm_iommu_remote_spin_lock(iommu_drvdata->needs_rem_spinlock);
 
 	SET_TLBIASID(iommu_drvdata->base, ctx_drvdata->num,
 		    GET_CONTEXTIDR_ASID(iommu_drvdata->base, ctx_drvdata->num));
@@ -585,7 +615,7 @@ static void msm_iommu_detach_dev(struct iommu_domain *domain,
 	__reset_context(iommu_drvdata->base, iommu_drvdata->glb_base,
 			ctx_drvdata->num);
 
-	msm_iommu_remote_spin_unlock();
+	msm_iommu_remote_spin_unlock(iommu_drvdata->needs_rem_spinlock);
 
 	__disable_clocks(iommu_drvdata);
 
@@ -650,6 +680,9 @@ static unsigned long *make_second_level(struct msm_iommu_priv *priv,
 		pr_debug("Could not allocate second level table\n");
 		goto fail;
 	}
+#ifdef CONFIG_LGE_MEMORY_INFO
+	__inc_zone_page_state(virt_to_page((void *)sl), NR_IOMMU_PAGES);
+#endif
 	memset(sl, 0, SZ_4K);
 	clean_pte(sl, sl + NUM_SL_PTE, priv->pt.redirect);
 
@@ -904,6 +937,10 @@ static size_t msm_iommu_unmap(struct iommu_domain *domain, unsigned long va,
 			if (sl_table[i])
 				used = 1;
 		if (!used) {
+#ifdef CONFIG_LGE_MEMORY_INFO
+			__dec_zone_page_state(virt_to_page((void *)(unsigned long)sl_table),
+								NR_IOMMU_PAGES);
+#endif
 			free_page((unsigned long)sl_table);
 			*fl_pte = 0;
 
@@ -1195,6 +1232,10 @@ static int msm_iommu_unmap_range(struct iommu_domain *domain, unsigned int va,
 						break;
 					}
 			if (!used) {
+#ifdef CONFIG_LGE_MEMORY_INFO
+				__dec_zone_page_state(virt_to_page((void *)(unsigned long)sl_table),
+									NR_IOMMU_PAGES);
+#endif
 				free_page((unsigned long)sl_table);
 				*fl_pte = 0;
 
@@ -1246,7 +1287,7 @@ static phys_addr_t msm_iommu_iova_to_phys(struct iommu_domain *domain,
 	if (ret)
 		goto fail;
 
-	msm_iommu_remote_spin_lock();
+	msm_iommu_remote_spin_lock(iommu_drvdata->needs_rem_spinlock);
 
 	SET_V2PPR(base, ctx, va & V2Pxx_VA);
 
@@ -1262,7 +1303,7 @@ static phys_addr_t msm_iommu_iova_to_phys(struct iommu_domain *domain,
 	if (GET_FAULT(base, ctx))
 		ret = 0;
 
-	msm_iommu_remote_spin_unlock();
+	msm_iommu_remote_spin_unlock(iommu_drvdata->needs_rem_spinlock);
 
 	__disable_clocks(iommu_drvdata);
 fail:
@@ -1324,7 +1365,7 @@ irqreturn_t msm_iommu_fault_handler(int irq, void *dev_id)
 	if (ret)
 		goto fail;
 
-	msm_iommu_remote_spin_lock();
+	msm_iommu_remote_spin_lock(drvdata->needs_rem_spinlock);
 
 	fsr = GET_FSR(base, num);
 
@@ -1357,7 +1398,7 @@ irqreturn_t msm_iommu_fault_handler(int irq, void *dev_id)
 	} else
 		ret = IRQ_NONE;
 
-	msm_iommu_remote_spin_unlock();
+	msm_iommu_remote_spin_unlock(drvdata->needs_rem_spinlock);
 
 	__disable_clocks(drvdata);
 fail:
